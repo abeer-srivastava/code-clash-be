@@ -1,0 +1,75 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+
+// for running the prisma 
+// npx prisma generate --schema ./src/prisma/schema.prisma  
+// for migrating the prisma
+
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User{
+  id        String      @id    @default(uuid())
+  name      String      
+  email     String      @unique
+  password  String
+  rooms    Room[]
+  chats     Chat[]
+  player1Battles  Battle[] @relation("Player1Battles")
+  player2Battles  Battle[] @relation("Player2Battles")
+  winnerBattles   Battle[] @relation("WinnerBattles")
+}
+model Room{
+  id          Int        @id   @default(autoincrement())
+  slug        String?    @unique
+  createdAt   DateTime   @default(now())
+  adminId     String
+  admin       User       @relation(fields: [adminId],references: [id])
+  chat        Chat[]
+  battle      Battle[]
+}
+model Chat{
+  id          Int        @id   @default(autoincrement())
+  message     String
+  userId      String
+  roomId      Int
+  room        Room      @relation(fields: [roomId],references: [id])
+  user        User      @relation(fields: [userId],references: [id])
+}
+
+model Question {
+  id        Int      @id @default(autoincrement())
+  title     String
+  prompt    String
+  difficulty String
+  input     String
+  output    String
+  battles   Battle[]     
+}
+
+model Battle {
+  id          Int      @id @default(autoincrement())
+  roomId      Int      @unique
+  questionId  Int      
+  player1Id   String
+  player2Id   String
+  winnerId    String?
+  startedAt   DateTime @default(now())
+  endedAt     DateTime?
+  status      String      @default("PENDING")  // "IN_PROGRESS" | "COMPLETED"
+  room         Room        @relation(fields: [roomId], references: [id] ,onDelete: Cascade)
+  question     Question    @relation(fields: [questionId], references: [id],onDelete: Cascade)
+  player1      User        @relation("Player1Battles", fields: [player1Id], references: [id])
+  player2      User        @relation("Player2Battles", fields: [player2Id], references: [id])
+  winner       User?       @relation("WinnerBattles", fields: [winnerId], references: [id])
+}
