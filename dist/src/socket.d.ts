@@ -7,6 +7,7 @@ export declare class SocketManager {
     private rooms;
     private battleRooms;
     private executor;
+    private prisma;
     private readonly BATTLE_TIMEOUT;
     private readonly BATTLE_CHECK_INTERVAL;
     private constructor();
@@ -18,6 +19,8 @@ export declare class SocketManager {
     private handleJoinRoom;
     private broadcastRoomState;
     private createManualBattle;
+    private handleSetVote;
+    private handleRunCode;
     private handleCodeSubmission;
     private handleChat;
     private createBattle;

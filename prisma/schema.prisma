@@ -10,12 +10,13 @@
 // for migrating the prisma
 
 generator client {
-  provider = "prisma-client"
-  output   = "./generated/prisma"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User{
@@ -52,8 +53,9 @@ model Question {
   title     String
   prompt    String
   difficulty String
-  input     String
-  output    String
+  examples  Json     // Array of {input, output, explanation}
+  testCases Json     // Array of {input, expectedOutput}
+  starterCode Json?  // Map of language to starter code
   battles   Battle[]     
 }
 

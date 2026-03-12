@@ -3,8 +3,6 @@ export interface ExecutionResult {
     output: string;
     error?: string;
     time?: number;
-    memory?: number;
-    timedOut?: boolean;
     status: "SUCCESS" | "ERROR" | "TIMEOUT" | "RUNTIME_ERROR";
 }
 export interface TestCaseResult {
@@ -13,34 +11,25 @@ export interface TestCaseResult {
     expected: string;
     actual: string;
     error?: string;
+    time?: number | undefined;
 }
 export declare class CodeExecutor {
     private static instance;
-    private tempDir;
-    private readonly TIMEOUT;
-    private readonly MEMORY_LIMIT;
-    private readonly CPU_LIMIT;
-    private readonly MAX_OUTPUT;
+    private readonly JUDGE0_URL;
+    private readonly JUDGE0_KEY;
+    private readonly JUDGE0_HOST;
     private constructor();
-    private ensureTempDir;
     static getInstance(): CodeExecutor;
     /**
-     * Execute code with timeout protection and resource limits
-     * @param code The source code to execute
-     * @param language Programming language (javascript, python, java)
-     * @param input Standard input for the program
-     * @returns ExecutionResult with output, errors, and timing info
+     * Judge0 Language IDs
+     * Common IDs (adjust based on your Judge0 version/provider)
      */
+    private getLanguageId;
+    private executeLocally;
     execute(code: string, language: string, input: string): Promise<ExecutionResult>;
-    /**
-     * Execute code against test cases
-     */
     executeTestCases(code: string, language: string, testCases: Array<{
         input: string;
         expectedOutput: string;
-    }>, testCaseIds: string[]): Promise<TestCaseResult[]>;
-    private getFileExtension;
-    private getDockerCommand;
-    private executeWithTimeout;
+    }>): Promise<TestCaseResult[]>;
 }
 //# sourceMappingURL=executor.d.ts.map

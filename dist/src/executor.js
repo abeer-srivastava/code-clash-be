@@ -1,24 +1,14 @@
-import { exec } from "child_process";
-import fs from "fs/promises";
+import axios from "axios";
+import { execSync } from "child_process";
+import fs from "fs";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
-import { execSync } from "child_process";
 export class CodeExecutor {
     constructor() {
-        this.TIMEOUT = 5000; // 5 seconds timeout
-        this.MEMORY_LIMIT = "512m";
-        this.CPU_LIMIT = "1";
-        this.MAX_OUTPUT = 10000; // Max output chars
-        this.tempDir = path.join(process.cwd(), "temp_submissions");
-        this.ensureTempDir();
-    }
-    async ensureTempDir() {
-        try {
-            await fs.mkdir(this.tempDir, { recursive: true });
-        }
-        catch (e) {
-            console.error("Error creating temp dir", e);
-        }
+        // Default to RapidAPI Judge0 URL if not provided
+        this.JUDGE0_URL = process.env.JUDGE0_API_URL || "https://judge0-ce.p.rapidapi.com";
+        this.JUDGE0_KEY = process.env.JUDGE0_API_KEY;
+        this.JUDGE0_HOST = process.env.JUDGE0_API_HOST || "judge0-ce.p.rapidapi.com";
     }
     static getInstance() {
         if (!CodeExecutor.instance) {
@@ -27,177 +17,140 @@ export class CodeExecutor {
         return CodeExecutor.instance;
     }
     /**
-     * Execute code with timeout protection and resource limits
-     * @param code The source code to execute
-     * @param language Programming language (javascript, python, java)
-     * @param input Standard input for the program
-     * @returns ExecutionResult with output, errors, and timing info
+     * Judge0 Language IDs
+     * Common IDs (adjust based on your Judge0 version/provider)
      */
-    async execute(code, language, input) {
+    getLanguageId(lang) {
+        switch (lang.toLowerCase()) {
+            case "python":
+            case "py":
+            case "python3":
+                return 71; // Python (3.8.1)
+            case "java":
+                return 62; // Java (OpenJDK 13.0.1)
+            case "cpp":
+            case "c++":
+                return 54; // C++ (GCC 9.2.0)
+            case "javascript":
+            case "js":
+            case "nodejs":
+                return 63; // Node.js (12.14.0)
+            case "typescript":
+            case "ts":
+                return 74; // TypeScript (3.7.4)
+            default:
+                return 63; // Default to Node.js
+        }
+    }
+    executeLocally(code, input) {
         const id = uuidv4();
-        const fileExtension = this.getFileExtension(language);
-        const filename = `${id}.${fileExtension}`;
-        const filepath = path.join(this.tempDir, filename);
+        // Use .cjs to bypass ESM "require is not defined" error in a "type": "module" project
+        const tempFile = path.join(process.cwd(), `temp_${id}.cjs`);
         try {
-            // Write code to file
-            await fs.writeFile(filepath, code);
-            // Get docker command based on language
-            const dockerCmd = this.getDockerCommand(language, filepath, input);
-            // Execute with timeout
-            const result = await this.executeWithTimeout(dockerCmd, filepath);
-            return result;
+            fs.writeFileSync(tempFile, code);
+            const output = execSync(`node ${tempFile}`, {
+                input,
+                encoding: 'utf8',
+                timeout: 5000
+            });
+            return {
+                success: true,
+                output: output,
+                status: "SUCCESS"
+            };
         }
         catch (e) {
             return {
                 success: false,
-                output: "",
-                error: e.message || "Unknown execution error",
-                time: 0,
-                status: "RUNTIME_ERROR",
+                output: e.stdout || "",
+                error: e.stderr || e.message,
+                status: "RUNTIME_ERROR"
             };
         }
         finally {
-            // Cleanup temp file
-            await fs.unlink(filepath).catch(() => { });
+            if (fs.existsSync(tempFile))
+                fs.unlinkSync(tempFile);
         }
     }
-    /**
-     * Execute code against test cases
-     */
-    async executeTestCases(code, language, testCases, testCaseIds) {
+    async execute(code, language, input) {
+        const languageId = this.getLanguageId(language);
+        // Use Judge0 if URL is provided (it's provided by default or via env)
+        if (this.JUDGE0_URL) {
+            try {
+                const headers = {
+                    "content-type": "application/json",
+                };
+                let isRapidAPI = false;
+                // Add RapidAPI headers only if key is provided and not a placeholder
+                if (this.JUDGE0_KEY && !this.JUDGE0_KEY.includes("your_")) {
+                    headers["x-rapidapi-key"] = this.JUDGE0_KEY;
+                    if (this.JUDGE0_HOST) {
+                        headers["x-rapidapi-host"] = this.JUDGE0_HOST;
+                    }
+                    isRapidAPI = true;
+                }
+                console.log(`[EXECUTOR] Executing ${language} (ID: ${languageId}) via ${isRapidAPI ? 'RapidAPI' : 'Local Judge0'} at ${this.JUDGE0_URL}`);
+                const response = await axios.post(`${this.JUDGE0_URL}/submissions?base64_encoded=false&wait=true`, {
+                    source_code: code,
+                    language_id: languageId,
+                    stdin: input,
+                }, { headers });
+                const data = response.data;
+                const status = data.status.id;
+                // Judge0 Status IDs: 3 = Accepted, 4 = Wrong Answer, 5 = Time Limit Exceeded, 6 = Compilation Error, 7-12 = Runtime Error
+                const success = status === 3;
+                let executionStatus = "SUCCESS";
+                if (status === 5)
+                    executionStatus = "TIMEOUT";
+                else if (status === 6)
+                    executionStatus = "ERROR";
+                else if (status > 6)
+                    executionStatus = "RUNTIME_ERROR";
+                return {
+                    success: success,
+                    output: data.stdout || "",
+                    error: data.stderr || data.compile_output || data.message || (success ? "" : "Execution Failed (No error message provided)"),
+                    time: data.time ? parseFloat(data.time) * 1000 : 0,
+                    status: executionStatus,
+                };
+            }
+            catch (error) {
+                const errorMsg = error.response?.data?.message || error.response?.data?.error || error.message;
+                console.warn("[EXECUTOR] Judge0 API failed:", errorMsg);
+            }
+        }
+        // Fallback to local execution for JS if API fails or keys missing
+        if (language.toLowerCase() === 'javascript' || language.toLowerCase() === 'js') {
+            console.log("[EXECUTOR] Falling back to local execution for JavaScript");
+            return this.executeLocally(code, input);
+        }
+        return {
+            success: false,
+            output: "",
+            error: "Execution Failed: Judge0 API connection failed and no local runner available for this language.",
+            status: "ERROR",
+        };
+    }
+    async executeTestCases(code, language, testCases) {
         const results = [];
         for (let i = 0; i < testCases.length; i++) {
-            const testCase = testCases[i];
-            if (!testCase)
+            const tc = testCases[i];
+            if (!tc)
                 continue;
-            const testCaseId = testCaseIds[i] || `test_${i}`;
-            try {
-                const execResult = await this.execute(code, language, testCase.input);
-                const actualOutput = execResult.output.trim();
-                const expectedOutput = testCase.expectedOutput.trim();
-                const passed = actualOutput === expectedOutput;
-                const result = {
-                    testCaseId,
-                    passed,
-                    expected: expectedOutput,
-                    actual: actualOutput,
-                };
-                if (execResult.error) {
-                    result.error = execResult.error;
-                }
-                results.push(result);
-            }
-            catch (e) {
-                const result = {
-                    testCaseId,
-                    passed: false,
-                    expected: testCase.expectedOutput,
-                    actual: "",
-                };
-                if (e.message) {
-                    result.error = e.message;
-                }
-                results.push(result);
-            }
+            const execResult = await this.execute(code, language, tc.input);
+            const actual = (execResult.output || "").trim();
+            const expected = (tc.expectedOutput || "").trim();
+            const passed = actual === expected && execResult.success;
+            results.push({
+                testCaseId: `test_${i + 1}`,
+                passed,
+                expected,
+                actual,
+                time: execResult.time,
+                ...(execResult.error ? { error: execResult.error } : {})
+            });
         }
         return results;
-    }
-    getFileExtension(language) {
-        switch (language.toLowerCase()) {
-            case "python":
-            case "py":
-                return "py";
-            case "java":
-                return "java";
-            case "cpp":
-            case "c++":
-                return "cpp";
-            case "javascript":
-            case "js":
-            default:
-                return "js";
-        }
-    }
-    getDockerCommand(language, filepath, input) {
-        const dockerBase = `docker run --rm -v ${filepath}:/app/code --network none --memory ${this.MEMORY_LIMIT} --cpus ${this.CPU_LIMIT}`;
-        let runCommand = "";
-        switch (language.toLowerCase()) {
-            case "python":
-            case "py":
-                runCommand = `${dockerBase} python:3.11-alpine python /app/code`;
-                break;
-            case "java":
-                // Wrap Java code in a class
-                runCommand = `${dockerBase} openjdk:17-alpine java /app/code`;
-                break;
-            case "cpp":
-            case "c++":
-                runCommand = `${dockerBase} gcc:latest /app/code`;
-                break;
-            case "javascript":
-            case "js":
-            default:
-                runCommand = `${dockerBase} node:18-alpine node /app/code`;
-                break;
-        }
-        // Add input via stdin if provided
-        if (input) {
-            runCommand += ` << 'EOF'\n${input}\nEOF`;
-        }
-        return runCommand;
-    }
-    executeWithTimeout(command, filepath) {
-        return new Promise((resolve) => {
-            const startTime = Date.now();
-            let timedOut = false;
-            const timeout = setTimeout(() => {
-                timedOut = true;
-                resolve({
-                    success: false,
-                    output: "",
-                    error: "Execution timeout - code took longer than 5 seconds",
-                    time: this.TIMEOUT,
-                    timedOut: true,
-                    status: "TIMEOUT",
-                });
-            }, this.TIMEOUT);
-            try {
-                exec(command, { maxBuffer: this.MAX_OUTPUT * 10 }, async (error, stdout, stderr) => {
-                    clearTimeout(timeout);
-                    if (timedOut)
-                        return; // Timeout already handled
-                    const endTime = Date.now();
-                    const executionTime = endTime - startTime;
-                    if (error && error.code !== 0) {
-                        resolve({
-                            success: false,
-                            output: stdout.slice(0, this.MAX_OUTPUT),
-                            error: stderr.slice(0, this.MAX_OUTPUT) || error.message,
-                            time: executionTime,
-                            status: "ERROR",
-                        });
-                    }
-                    else {
-                        resolve({
-                            success: true,
-                            output: stdout.slice(0, this.MAX_OUTPUT),
-                            time: executionTime,
-                            status: "SUCCESS",
-                        });
-                    }
-                });
-            }
-            catch (e) {
-                clearTimeout(timeout);
-                resolve({
-                    success: false,
-                    output: "",
-                    error: e.message,
-                    time: Date.now() - startTime,
-                    status: "RUNTIME_ERROR",
-                });
-            }
-        });
     }
 }
 //# sourceMappingURL=executor.js.map

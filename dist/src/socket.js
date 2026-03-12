@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Server } from "http";
 import { RedisManager } from "./redis.js";
 import { CodeExecutor } from "./executor.js";
+import { PrismaClient } from "@prisma/client";
 export class SocketManager {
     constructor(server) {
         this.BATTLE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
@@ -12,6 +13,7 @@ export class SocketManager {
         this.rooms = new Map();
         this.battleRooms = new Map();
         this.executor = CodeExecutor.getInstance();
+        this.prisma = new PrismaClient();
         this.init();
     }
     static getInstance(server) {
@@ -54,6 +56,12 @@ export class SocketManager {
                 case "JOIN_ROOM":
                     await this.handleJoinRoom(ws, payload);
                     break;
+                case "SET_VOTE":
+                    await this.handleSetVote(ws, payload);
+                    break;
+                case "RUN_CODE":
+                    await this.handleRunCode(ws, payload);
+                    break;
                 case "SUBMIT_CODE":
                     await this.handleCodeSubmission(ws, payload);
                     break;
@@ -70,20 +78,27 @@ export class SocketManager {
         }
     }
     async handleAuth(ws, payload) {
-        const userId = payload.userId;
+        const { userId, username } = payload;
         if (!userId) {
             this.sendError(ws, "INVALID_AUTH", "userId is required");
             return;
         }
-        // Store connection
         this.users.set(userId, ws);
         ws.userId = userId;
-        // Mock user info (TODO: fetch from database)
-        this.userInfo.set(userId, {
-            username: `User_${userId.substring(0, 6)}`,
+        const info = {
+            username: username || `User_${userId.substring(0, 6)}`,
             elo: 1200,
+        };
+        this.userInfo.set(userId, info);
+        // Update name in any active battle rooms
+        this.battleRooms.forEach((room, roomId) => {
+            if (room.player1Id === userId)
+                room.player1Data.username = info.username;
+            if (room.player2Id === userId)
+                room.player2Data.username = info.username;
+            this.broadcastRoomState(roomId);
         });
-        console.log(`User ${userId} authenticated`);
+        console.log(`User ${userId} authenticated as ${info.username}`);
     }
     async handleJoinMatchmaking(ws, payload) {
         const userId = ws.userId;
@@ -121,8 +136,30 @@ export class SocketManager {
         if (!battleRoom) {
             const occupants = Array.from(this.rooms.get(roomId) || []);
             if (occupants.length >= 2 && occupants[0] && occupants[1]) {
-                console.log(`2 users in room ${roomId}, starting manual battle`);
-                await this.createManualBattle(roomId, occupants[0], occupants[1]);
+                console.log(`2 users in room ${roomId}, initializing lobby`);
+                // Create a waiting room state with voting enabled
+                this.battleRooms.set(roomId, {
+                    roomId,
+                    player1Id: occupants[0],
+                    player2Id: occupants[1],
+                    player1Data: {
+                        userId: occupants[0],
+                        username: this.userInfo.get(occupants[0])?.username || `User_${occupants[0].substring(0, 6)}`,
+                        elo: this.userInfo.get(occupants[0])?.elo || 1200,
+                    },
+                    player2Data: {
+                        userId: occupants[1],
+                        username: this.userInfo.get(occupants[1])?.username || `User_${occupants[1].substring(0, 6)}`,
+                        elo: this.userInfo.get(occupants[1])?.elo || 1200,
+                    },
+                    battleState: {
+                        roomId,
+                        status: "WAITING",
+                        startTime: Date.now(),
+                    },
+                    startTime: Date.now(),
+                    votes: {},
+                });
             }
         }
         // Broadcast current state to everyone in the room to ensure consistency
@@ -166,6 +203,7 @@ export class SocketManager {
                     battleState: battleRoom.battleState,
                     players: [player1Info, player2Info],
                     question: battleRoom.question,
+                    votes: battleRoom.votes,
                 },
             });
         }
@@ -192,8 +230,25 @@ export class SocketManager {
             });
         }
     }
-    async createManualBattle(roomId, player1Id, player2Id) {
+    async createManualBattle(roomId, player1Id, player2Id, difficulty = "EASY") {
         try {
+            // Fetch random question of the chosen difficulty
+            const questions = await this.prisma.question.findMany({
+                where: { difficulty }
+            });
+            if (questions.length === 0) {
+                console.error(`No questions found for difficulty: ${difficulty}`);
+                this.sendToRoom(roomId, {
+                    type: "ERROR",
+                    payload: { code: "NO_QUESTIONS", message: `No ${difficulty} questions available.` }
+                });
+                return;
+            }
+            const selectedQuestion = questions[Math.floor(Math.random() * questions.length)];
+            if (!selectedQuestion) {
+                console.error(`Failed to select a question for difficulty: ${difficulty}`);
+                return;
+            }
             const player1Username = this.userInfo.get(player1Id)?.username || `User_${player1Id.substring(0, 6)}`;
             const player2Username = this.userInfo.get(player2Id)?.username || `User_${player2Id.substring(0, 6)}`;
             const player1Elo = this.userInfo.get(player1Id)?.elo || 1200;
@@ -219,30 +274,19 @@ export class SocketManager {
                     startTime,
                 },
                 startTime,
-                questionId: 1,
-            };
-            battleRoom.question = {
-                id: 1,
-                title: "Hello World",
-                prompt: 'Write a function that prints "Hello Code Clash!" to the console.',
-                difficulty: "EASY",
-                examples: [
-                    {
-                        input: "",
-                        output: "Hello Code Clash!",
-                        explanation: "Simply print the message",
-                    },
-                ],
-                testCases: [
-                    {
-                        id: "test_1",
-                        input: "",
-                        expectedOutput: "Hello Code Clash!",
-                    },
-                ],
+                questionId: selectedQuestion.id,
+                question: {
+                    id: selectedQuestion.id,
+                    title: selectedQuestion.title,
+                    prompt: selectedQuestion.prompt,
+                    difficulty: selectedQuestion.difficulty,
+                    examples: selectedQuestion.examples,
+                    testCases: selectedQuestion.testCases,
+                    starterCode: selectedQuestion.starterCode
+                }
             };
             this.battleRooms.set(roomId, battleRoom);
-            console.log(`Manual battle created for room ${roomId}: ${player1Id} vs ${player2Id}`);
+            console.log(`Battle created for room ${roomId} with question: ${selectedQuestion.title}`);
             // Set battle timeout
             setTimeout(() => this.timeoutBattle(roomId), this.BATTLE_TIMEOUT);
         }
@@ -250,9 +294,101 @@ export class SocketManager {
             console.error("Error creating manual battle:", error);
         }
     }
+    async handleSetVote(ws, payload) {
+        const userId = ws.userId;
+        const { roomId, difficulty } = payload;
+        if (!userId || !roomId || !difficulty) {
+            this.sendError(ws, "INVALID_PARAMS", "roomId and difficulty are required");
+            return;
+        }
+        const battleRoom = this.battleRooms.get(roomId);
+        if (!battleRoom)
+            return;
+        if (!battleRoom.votes)
+            battleRoom.votes = {};
+        battleRoom.votes[userId] = difficulty;
+        // Broadcast update
+        this.sendToRoom(roomId, {
+            type: "VOTE_UPDATE",
+            payload: { votes: battleRoom.votes }
+        });
+        // Check for consensus
+        const votes = Object.values(battleRoom.votes);
+        if (votes.length >= 2) {
+            const allSame = votes.every(v => v === votes[0]);
+            if (allSame) {
+                console.log(`Consensus reached for ${votes[0]} in room ${roomId}`);
+                await this.createManualBattle(roomId, battleRoom.player1Id, battleRoom.player2Id, votes[0]);
+                this.broadcastRoomState(roomId);
+            }
+        }
+    }
+    async handleRunCode(ws, payload) {
+        const userId = ws.userId;
+        const { roomId, code, language } = payload;
+        console.log(`[SOCKET] Received code run request from ${userId} for room ${roomId} (${language})`);
+        if (!userId || !roomId || !code || !language) {
+            this.sendError(ws, "INVALID_PARAMS", "roomId, code, and language are required");
+            return;
+        }
+        const battleRoom = this.battleRooms.get(roomId);
+        if (!battleRoom) {
+            this.sendError(ws, "BATTLE_NOT_FOUND", `Battle room ${roomId} not found`);
+            return;
+        }
+        try {
+            // Priority 1: Use non-hidden testCases from the database
+            // Priority 2: Fallback to examples if no testCases exist
+            let testCasesToRun = [];
+            if (battleRoom.question?.testCases && battleRoom.question.testCases.length > 0) {
+                testCasesToRun = battleRoom.question.testCases
+                    .filter(tc => !tc.isHidden)
+                    .map(tc => ({
+                    input: tc.input,
+                    expectedOutput: tc.expectedOutput
+                }));
+            }
+            // If still no test cases, fallback to examples
+            if (testCasesToRun.length === 0 && battleRoom.question?.examples) {
+                testCasesToRun = battleRoom.question.examples.map(ex => ({
+                    input: ex.input,
+                    expectedOutput: ex.output
+                }));
+            }
+            if (testCasesToRun.length === 0) {
+                this.sendError(ws, "NO_TEST_CASES", "No test cases available to run.");
+                return;
+            }
+            const results = await this.executor.executeTestCases(code, language, testCasesToRun);
+            const testsPassed = results.filter(r => r.passed).length;
+            const totalTests = results.length;
+            const passedAllTests = testsPassed === totalTests && totalTests > 0;
+            const totalExecutionTime = results.reduce((acc, r) => acc + (r.time || 0), 0);
+            const runResult = {
+                type: "RUN_RESULT",
+                payload: {
+                    userId,
+                    roomId,
+                    success: passedAllTests,
+                    output: results.map(r => `Test Case ${r.testCaseId}: ${r.passed ? 'PASSED' : 'FAILED'} (${(r.time || 0).toFixed(2)}ms)\nActual: ${r.actual || '(no output)'}\nExpected: ${r.expected}${r.error ? '\nError: ' + r.error : ''}`).join('\n\n'),
+                    error: results.find(r => r.error)?.error,
+                    time: totalExecutionTime,
+                    testsPassed,
+                    totalTests,
+                },
+            };
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(runResult));
+            }
+        }
+        catch (error) {
+            this.sendError(ws, "EXECUTION_ERROR", error.message);
+        }
+    }
     async handleCodeSubmission(ws, payload) {
         const userId = ws.userId;
         const { roomId, code, language } = payload;
+        console.log(`[SOCKET] Received code submission from ${userId} for room ${roomId} (${language})`);
         if (!userId || !roomId || !code || !language) {
             this.sendError(ws, "INVALID_PARAMS", "roomId, code, and language are required");
             return;
@@ -277,20 +413,27 @@ export class SocketManager {
             this.sendError(ws, "ALREADY_SUBMITTED", "You have already submitted code");
             return;
         }
-        // Execute code
+        // Execute code against all test cases
         const submissionTime = Date.now() - battleRoom.startTime;
+        console.log(`[SOCKET] Starting final submission for ${userId}. Found ${battleRoom.question?.testCases?.length || 0} total test cases.`);
         try {
-            const execResult = await this.executor.execute(code, language, "");
+            // Final submission uses ALL test cases (including hidden ones)
+            const testCases = battleRoom.question?.testCases || [];
+            const results = await this.executor.executeTestCases(code, language, testCases);
+            const testsPassed = results.filter(r => r.passed).length;
+            const totalTests = results.length;
+            const passedAllTests = testsPassed === totalTests && totalTests > 0;
+            const totalExecutionTime = results.reduce((acc, r) => acc + (r.time || 0), 0);
             const submission = {
                 code: code,
                 language: language,
                 submissionTime,
-                executionTime: execResult.time || 0,
-                output: execResult.output,
-                error: execResult.error || undefined,
-                testsPassed: execResult.status === "SUCCESS" ? 1 : 0,
-                totalTests: 1,
-                passed: execResult.success,
+                executionTime: totalExecutionTime,
+                output: results.map(r => `Test ${r.testCaseId}: ${r.passed ? 'PASSED' : 'FAILED'} (${(r.time || 0).toFixed(2)}ms)\nActual: ${r.actual || '(no output)'}\nExpected: ${r.expected}${r.error ? '\nError: ' + r.error : ''}`).join('\n\n'),
+                error: results.find(r => r.error)?.error,
+                testsPassed,
+                totalTests,
+                passed: passedAllTests,
             };
             // Update player data
             playerData.submission = submission;
@@ -300,13 +443,13 @@ export class SocketManager {
                 payload: {
                     userId,
                     roomId,
-                    success: execResult.success,
-                    output: execResult.output,
-                    error: execResult.error,
-                    time: execResult.time || 0,
-                    testsPassed: submission.testsPassed,
-                    totalTests: submission.totalTests,
-                    passedAllTests: submission.passed,
+                    success: passedAllTests,
+                    output: submission.output,
+                    error: submission.error,
+                    time: totalExecutionTime,
+                    testsPassed,
+                    totalTests,
+                    passedAllTests,
                     submissionTime,
                 },
             });
@@ -420,30 +563,28 @@ export class SocketManager {
     }
     async checkBattleCompletion(roomId, battleRoom) {
         const { player1Data, player2Data } = battleRoom;
-        // Check if both players have submitted
-        if (!player1Data.submission || !player2Data.submission) {
+        // 1. Immediate Winner: If current submission passed everything
+        if (player1Data.submission?.passed) {
+            await this.endBattle(roomId, battleRoom, battleRoom.player1Id, false);
             return;
         }
-        // Determine winner
-        let winnerId;
-        const isDraw = !player1Data.submission.passed && !player2Data.submission.passed;
-        if (player1Data.submission.passed && !player2Data.submission.passed) {
-            winnerId = battleRoom.player1Id;
+        if (player2Data.submission?.passed) {
+            await this.endBattle(roomId, battleRoom, battleRoom.player2Id, false);
+            return;
         }
-        else if (!player1Data.submission.passed && player2Data.submission.passed) {
-            winnerId = battleRoom.player2Id;
-        }
-        else if (player1Data.submission.passed && player2Data.submission.passed) {
-            // Both passed, winner is faster
-            if (player1Data.submission.submissionTime < player2Data.submission.submissionTime) {
+        // 2. Both have submitted but neither passed everything
+        if (player1Data.submission && player2Data.submission) {
+            // Determine winner based on tests passed if neither got 100%
+            let winnerId;
+            const isDraw = player1Data.submission.testsPassed === player2Data.submission.testsPassed;
+            if (player1Data.submission.testsPassed > player2Data.submission.testsPassed) {
                 winnerId = battleRoom.player1Id;
             }
-            else if (player2Data.submission.submissionTime < player1Data.submission.submissionTime) {
+            else if (player2Data.submission.testsPassed > player1Data.submission.testsPassed) {
                 winnerId = battleRoom.player2Id;
             }
+            await this.endBattle(roomId, battleRoom, winnerId, isDraw);
         }
-        // End battle
-        await this.endBattle(roomId, battleRoom, winnerId, isDraw);
     }
     async endBattle(roomId, battleRoom, winnerId, isDraw) {
         battleRoom.battleState.status = "COMPLETED";
@@ -507,8 +648,22 @@ export class SocketManager {
                     if (occupants.has(userId)) {
                         occupants.delete(userId);
                         console.log(`User ${userId} removed from room ${roomId}`);
-                        // Broadcast new room state to remaining users
-                        this.broadcastRoomState(roomId);
+                        // If battle is in progress, declare the other user winner
+                        const battleRoom = this.battleRooms.get(roomId);
+                        if (battleRoom && (battleRoom.battleState.status === "IN_PROGRESS" || battleRoom.battleState.status === "WAITING")) {
+                            const remainingPlayerId = battleRoom.player1Id === userId ? battleRoom.player2Id : battleRoom.player1Id;
+                            console.log(`Battle ${roomId} ending due to disconnect. Winner: ${remainingPlayerId}`);
+                            if (battleRoom.battleState.status === "IN_PROGRESS") {
+                                this.endBattle(roomId, battleRoom, remainingPlayerId, false);
+                            }
+                            else {
+                                this.battleRooms.delete(roomId);
+                                this.broadcastRoomState(roomId);
+                            }
+                        }
+                        else {
+                            this.broadcastRoomState(roomId);
+                        }
                     }
                 });
             }

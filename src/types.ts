@@ -41,6 +41,22 @@ export interface JoinRoomMessage {
     };
 }
 
+export interface SetVoteMessage {
+    type: "SET_VOTE";
+    payload: {
+        roomId: string;
+        userId: string;
+        difficulty: "EASY" | "MEDIUM" | "HARD";
+    };
+}
+
+export interface VoteUpdateMessage {
+    type: "VOTE_UPDATE";
+    payload: {
+        votes: Record<string, "EASY" | "MEDIUM" | "HARD">;
+    };
+}
+
 export interface RoomStateMessage {
     type: "ROOM_STATE";
     payload: {
@@ -52,6 +68,30 @@ export interface RoomStateMessage {
 }
 
 // ============ CODE SUBMISSION ============
+export interface RunCodeMessage {
+    type: "RUN_CODE";
+    payload: {
+        roomId: string;
+        userId: string;
+        code: string;
+        language: string;
+    };
+}
+
+export interface RunCodeResultMessage {
+    type: "RUN_RESULT";
+    payload: {
+        userId: string;
+        roomId: string;
+        success: boolean;
+        output?: string;
+        error?: string;
+        time: number;
+        testsPassed?: number;
+        totalTests?: number;
+    };
+}
+
 export interface SubmitCodeMessage {
     type: "SUBMIT_CODE";
     payload: {
@@ -122,6 +162,7 @@ export interface QuestionData {
         expectedOutput: string;
         isHidden?: boolean;
     }>;
+    starterCode?: Record<string, string>;
     timeLimit?: number; // seconds
     memoryLimit?: number; // MB
 }
@@ -197,7 +238,9 @@ export type WebSocketMessage =
     | JoinMatchmakingMessage
     | MatchFoundMessage
     | JoinRoomMessage
+    | SetVoteMessage
     | RoomStateMessage
+    | RunCodeMessage
     | SubmitCodeMessage
     | SubmissionResultMessage
     | ChatMessage
@@ -208,6 +251,8 @@ export type WebSocketMessage =
 export type ServerMessage =
     | MatchFoundMessage
     | RoomStateMessage
+    | VoteUpdateMessage
+    | RunCodeResultMessage
     | SubmissionResultMessage
     | ChatMessageReceived
     | BattleEndMessage
