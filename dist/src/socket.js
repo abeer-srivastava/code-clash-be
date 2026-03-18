@@ -13,7 +13,9 @@ export class SocketManager {
         this.rooms = new Map();
         this.battleRooms = new Map();
         this.executor = CodeExecutor.getInstance();
-        this.prisma = new PrismaClient();
+        this.prisma = new PrismaClient({
+            log: ['error'],
+        });
         this.init();
     }
     static getInstance(server) {
@@ -370,8 +372,7 @@ export class SocketManager {
                     userId,
                     roomId,
                     success: passedAllTests,
-                    output: results.map(r => `Test Case ${r.testCaseId}: ${r.passed ? 'PASSED' : 'FAILED'} (${(r.time || 0).toFixed(2)}ms)\nActual: ${r.actual || '(no output)'}\nExpected: ${r.expected}${r.error ? '\nError: ' + r.error : ''}`).join('\n\n'),
-                    error: results.find(r => r.error)?.error,
+                    testResults: results,
                     time: totalExecutionTime,
                     testsPassed,
                     totalTests,
@@ -429,8 +430,7 @@ export class SocketManager {
                 language: language,
                 submissionTime,
                 executionTime: totalExecutionTime,
-                output: results.map(r => `Test ${r.testCaseId}: ${r.passed ? 'PASSED' : 'FAILED'} (${(r.time || 0).toFixed(2)}ms)\nActual: ${r.actual || '(no output)'}\nExpected: ${r.expected}${r.error ? '\nError: ' + r.error : ''}`).join('\n\n'),
-                error: results.find(r => r.error)?.error,
+                testResults: results,
                 testsPassed,
                 totalTests,
                 passed: passedAllTests,
@@ -444,8 +444,7 @@ export class SocketManager {
                     userId,
                     roomId,
                     success: passedAllTests,
-                    output: submission.output,
-                    error: submission.error,
+                    testResults: results,
                     time: totalExecutionTime,
                     testsPassed,
                     totalTests,
