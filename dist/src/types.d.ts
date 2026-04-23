@@ -144,6 +144,26 @@ export interface QuestionData {
     timeLimit?: number;
     memoryLimit?: number;
 }
+export interface CursorMoveMessage {
+    type: "CURSOR_MOVE";
+    payload: {
+        roomId: string;
+        userId: string;
+        line: number;
+        ch: number;
+    };
+}
+export interface OpponentProgressMessage {
+    type: "OPPONENT_PROGRESS";
+    payload: {
+        userId: string;
+        roomId: string;
+        activity: "RUNNING" | "SUBMITTING" | "IDLE";
+        testsPassed?: number;
+        totalTests?: number;
+        success?: boolean;
+    };
+}
 export interface ChatMessage {
     type: "CHAT";
     payload: {
@@ -199,8 +219,8 @@ export interface ErrorMessage {
         details?: any;
     };
 }
-export type WebSocketMessage = AuthMessage | JoinMatchmakingMessage | MatchFoundMessage | JoinRoomMessage | SetVoteMessage | RoomStateMessage | RunCodeMessage | SubmitCodeMessage | SubmissionResultMessage | ChatMessage | BattleEndMessage | DisconnectMessage | ErrorMessage;
-export type ServerMessage = MatchFoundMessage | RoomStateMessage | VoteUpdateMessage | RunCodeResultMessage | SubmissionResultMessage | ChatMessageReceived | BattleEndMessage | ErrorMessage;
+export type WebSocketMessage = AuthMessage | JoinMatchmakingMessage | MatchFoundMessage | JoinRoomMessage | SetVoteMessage | RoomStateMessage | RunCodeMessage | SubmitCodeMessage | SubmissionResultMessage | ChatMessage | BattleEndMessage | DisconnectMessage | CursorMoveMessage | OpponentProgressMessage | ErrorMessage;
+export type ServerMessage = MatchFoundMessage | RoomStateMessage | VoteUpdateMessage | RunCodeResultMessage | SubmissionResultMessage | ChatMessageReceived | BattleEndMessage | CursorMoveMessage | OpponentProgressMessage | ErrorMessage;
 export interface Battle {
     id: string;
     roomId: string;

@@ -54,7 +54,8 @@ router.post("/room", verifyFirebaseToken, async (req, res) => {
     return res.status(400).json({ message: "Provide a valid room name" });
   }
 
-  const userId = (req as any).userId ?? (req as any).user?.uid ?? (req as any).user?.id;
+  const firebaseUser = (req as any).user;
+  const userId = firebaseUser?.uid;
   if (!userId) {
     return res.status(401).json({ message: "User not authenticated by middleware" });
   }
@@ -63,6 +64,18 @@ router.post("/room", verifyFirebaseToken, async (req, res) => {
   if (!slug) return res.status(400).json({ message: "Room name cannot be empty" });
 
   try {
+    // Ensure the user exists in the local DB (handles fresh / migrated databases)
+    await prisma.user.upsert({
+      where: { id: userId },
+      update: { email: firebaseUser.email || "", name: firebaseUser.name || "" },
+      create: {
+        id: userId,
+        email: firebaseUser.email || "",
+        name: firebaseUser.name || "",
+        password: "",
+      },
+    });
+
     // check existing first to give a stable response and avoid P2002
     const existing = await prisma.room.findUnique({ where: { slug } });
     if (existing) {

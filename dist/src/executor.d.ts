@@ -1,3 +1,4 @@
+import type { QuestionData } from "./types.js";
 /**
  * Robust execution result for a single test case
  */
@@ -38,7 +39,7 @@ export declare class CodeExecutor {
         input: string;
         expectedOutput: string;
         id?: string;
-    }>): Promise<TestCaseResult[]>;
+    }>, question?: QuestionData): Promise<TestCaseResult[]>;
     private executeLocallyBatch;
 }
 //# sourceMappingURL=executor.d.ts.map

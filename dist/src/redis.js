@@ -12,11 +12,33 @@ export class RedisManager {
     getClient() {
         return this.client;
     }
-    async addToQueue(userId, elo) {
-        await this.client.zadd("matchmaking:queue", elo, userId);
+    async addToQueue(userId, elo, language = "javascript") {
+        const multi = this.client.multi();
+        multi.zadd("matchmaking:queue", elo, userId);
+        multi.hset("matchmaking:join_times", userId, Date.now().toString());
+        multi.hset("matchmaking:languages", userId, language);
+        await multi.exec();
     }
     async removeFromQueue(userId) {
-        await this.client.zrem("matchmaking:queue", userId);
+        const multi = this.client.multi();
+        multi.zrem("matchmaking:queue", userId);
+        multi.hdel("matchmaking:join_times", userId);
+        multi.hdel("matchmaking:languages", userId);
+        await multi.exec();
+    }
+    async getUserLanguage(userId) {
+        return (await this.client.hget("matchmaking:languages", userId)) || "javascript";
+    }
+    async getQueue() {
+        return await this.client.zrange("matchmaking:queue", 0, -1);
+    }
+    async getUserElo(userId) {
+        const elo = await this.client.zscore("matchmaking:queue", userId);
+        return elo ? parseFloat(elo) : null;
+    }
+    async getUserJoinTime(userId) {
+        const time = await this.client.hget("matchmaking:join_times", userId);
+        return time ? parseInt(time) : null;
     }
     async findMatch(userId, elo, range = 100) {
         const potentialMatches = await this.client.zrangebyscore("matchmaking:queue", elo - range, elo + range);

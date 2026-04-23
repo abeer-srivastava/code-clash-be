@@ -3,6 +3,7 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
+import type { QuestionData } from "./types.js";
 
 /**
  * Robust execution result for a single test case
@@ -55,21 +56,52 @@ export class CodeExecutor {
         }
     }
 
-    private wrapCode(code: string, language: string): string {
+    private wrapCode(code: string, language: string, question?: QuestionData): string {
         const lang = language.toLowerCase();
         
-        // If the code already contains a driver-like structure (e.g., fs.readFileSync, sys.stdin, main function)
-        // we might not want to wrap it, but for a strict LeetCode experience, we assume the user provides ONLY the function.
-        // For now, we'll wrap it if it doesn't look like it already has the driver.
-        
-        if (lang === 'javascript' || lang === 'js' || lang === 'nodejs') {
-            if (code.includes('require(\'fs\')') || code.includes('process.stdin')) return code;
+        // Check if the code already has driver logic
+        const hasDriver = (
+            (lang === 'javascript' || lang === 'js' || lang === 'nodejs') && (code.includes('require(\'fs\')') || code.includes('process.stdin')) ||
+            (lang === 'python' || lang === 'py') && (code.includes('import sys') || code.includes('sys.stdin')) ||
+            (lang === 'cpp' || lang === 'c++') && (code.includes('int main') || code.includes('std::cin')) ||
+            (lang === 'java') && (code.includes('public static void main'))
+        );
+
+        if (hasDriver) return code;
+
+        // If no driver found, try to use the starterCode from the database as a template
+        if (question?.starterCode && (question.starterCode as any)[lang]) {
+            const starter = (question.starterCode as any)[lang];
             
-            // Extract function name from code to call it. 
-            // Default to twoSum if not found, but we should ideally know the function name from question data.
-            // For this project, we'll use a generic wrapper or assume standard names for now.
-            // A better way is to have the driver code in the database and replace a placeholder.
-            return code; // Fallback to raw code if we can't reliably wrap yet
+            // For languages like JavaScript, Python, we can search for a placeholder to inject user code
+            if (lang === 'javascript' || lang === 'js' || lang === 'nodejs') {
+                const placeholder = "// Write logic here";
+                if (starter.includes(placeholder)) {
+                    return starter.replace(placeholder, code);
+                }
+            } else if (lang === 'python' || lang === 'py') {
+                const placeholder = "# Write logic here";
+                if (starter.includes(placeholder)) {
+                    // Python is sensitive to indentation. We assume the function is defined at top level.
+                    // We'll replace the 'pass' and the placeholder.
+                    return starter.replace(placeholder + "\n    pass", code);
+                }
+            } else if (lang === 'cpp' || lang === 'c++') {
+                const placeholder = "// Write logic here";
+                if (starter.includes(placeholder)) {
+                    return starter.replace(placeholder, code);
+                }
+            } else if (lang === 'java') {
+                const placeholder = "// Write logic here";
+                if (starter.includes(placeholder)) {
+                    return starter.replace(placeholder, code);
+                }
+            }
+            
+            // If we can't find a placeholder but have starter code, 
+            // the user might have provided the full code or the starter is simple.
+            // As a last resort, just return the code.
+            return code;
         }
         
         return code;
@@ -89,7 +121,8 @@ export class CodeExecutor {
     public async executeTestCases(
         code: string,
         language: string,
-        testCases: Array<{ input: string; expectedOutput: string; id?: string }>
+        testCases: Array<{ input: string; expectedOutput: string; id?: string }>,
+        question?: QuestionData
     ): Promise<TestCaseResult[]> {
         if (!testCases.length) return [];
 
@@ -106,7 +139,7 @@ export class CodeExecutor {
         try {
             console.log(`[EXECUTOR] Batch executing ${testCases.length} cases for ${language} at ${this.JUDGE0_URL}`);
 
-            const wrappedCode = this.wrapCode(code, language);
+            const wrappedCode = this.wrapCode(code, language, question);
 
             // Prepare the batch payload
             const submissions = testCases.map(tc => ({
@@ -155,70 +188,131 @@ export class CodeExecutor {
                 }
             }
 
-            // 3. Map results to our format
-            return results.map((data: any, index: number) => {
+            // 3. Map results to our format and check for system failures
+            const mappedResults = results.map((data: any, index: number) => {
                 const tc = testCases[index];
-                if (!tc) {
-                    console.error(`[EXECUTOR] Test case at index ${index} not found in original request`);
-                    return {
-                        testCaseId: `test_${index + 1}`,
-                        passed: false,
-                        expected: "N/A",
-                        actual: "N/A",
-                        error: "Test case configuration error",
-                        statusDescription: "Configuration Error"
-                    };
-                }
+                if (!tc) return null;
                 
                 const statusId = data.status?.id;
-                
-                // 3 = Accepted
                 const passed = statusId === 3;
                 
                 const actual = this.fromBase64(data.stdout || "");
                 const stderr = this.fromBase64(data.stderr || "");
                 const compileOutput = this.fromBase64(data.compile_output || "");
+                const message = data.message || "";
+
+                // Check for the specific Judge0/Isolate "No such file" or cgroup errors
+                const isSystemError = 
+                    message.includes("rb_sysopen") || 
+                    message.includes("/box/") || 
+                    stderr.includes("No such file or directory") ||
+                    (data.status?.description === "Internal Error");
 
                 return {
                     testCaseId: tc.id || `test_${index + 1}`,
                     passed,
                     expected: tc.expectedOutput,
                     actual: actual,
-                    error: stderr || compileOutput || data.message || undefined,
+                    error: stderr || compileOutput || message || undefined,
                     time: data.time ? parseFloat(data.time) * 1000 : 0,
                     memory: data.memory,
-                    statusDescription: data.status?.description
+                    statusDescription: data.status?.description,
+                    isSystemError
                 };
-            });
+            }).filter(r => r !== null);
+
+            // If any result shows a Judge0 system failure, trigger the local fallback immediately
+            const hasSystemFailure = mappedResults.some(r => r?.isSystemError);
+            const lang = language.toLowerCase();
+            const supportedFallbackLangs = ['javascript', 'js', 'python', 'py', 'python3', 'cpp', 'c++'];
+            
+            if (hasSystemFailure && supportedFallbackLangs.includes(lang)) {
+                console.warn(`[EXECUTOR] Judge0 internal system failure detected. Falling back to local execution for ${language}.`);
+                return this.executeLocallyBatch(code, testCases, question, language);
+            } else if (hasSystemFailure) {
+                console.warn(`[EXECUTOR] Judge0 failed and no local fallback available for ${language}.`);
+                return [{
+                    testCaseId: testCases[0]?.id || "test_1",
+                    passed: false,
+                    expected: "",
+                    actual: "",
+                    error: `System Error: Sandbox execution failed. Local fallback not supported for ${language}.`,
+                    statusDescription: "Internal Error"
+                }];
+            }
+
+            return mappedResults as TestCaseResult[];
 
         } catch (error: any) {
             console.error("[EXECUTOR] Batch execution failed:", error.response?.data || error.message);
-            // Fallback for JS if batch fails
-            if (language.toLowerCase() === 'javascript' || language.toLowerCase() === 'js') {
-                return this.executeLocallyBatch(code, testCases);
+            const lang = language.toLowerCase();
+            const supportedFallbackLangs = ['javascript', 'js', 'python', 'py', 'python3', 'cpp', 'c++'];
+            
+            if (supportedFallbackLangs.includes(lang)) {
+                return this.executeLocallyBatch(code, testCases, question, language);
             }
             throw error;
         }
     }
 
-    private async executeLocallyBatch(code: string, testCases: any[]): Promise<TestCaseResult[]> {
+    private async executeLocallyBatch(code: string, testCases: any[], question?: QuestionData, executionLanguage?: string): Promise<TestCaseResult[]> {
         const results: TestCaseResult[] = [];
+        const lang = (executionLanguage || "javascript").toLowerCase();
+        const wrappedCode = this.wrapCode(code, lang, question);
+        
         for (let i = 0; i < testCases.length; i++) {
             const tc = testCases[i];
             const id = uuidv4();
-            const tempFile = path.join(process.cwd(), `temp_${id}.cjs`);
+            const tempDir = fs.existsSync(path.join(process.cwd(), "temp_submissions")) 
+                ? path.join(process.cwd(), "temp_submissions")
+                : process.cwd();
+            
+            let tempFile = path.join(tempDir, `local_${id}.cjs`);
+            let command = `node ${tempFile}`;
+            
+            if (lang === "python" || lang === "py" || lang === "python3") {
+                tempFile = path.join(tempDir, `local_${id}.py`);
+                command = `python3 ${tempFile}`;
+            } else if (lang === "cpp" || lang === "c++") {
+                tempFile = path.join(tempDir, `local_${id}.cpp`);
+                const executable = path.join(tempDir, `local_${id}.out`);
+                command = executable;
+                try {
+                    fs.writeFileSync(tempFile, wrappedCode);
+                    execSync(`g++ ${tempFile} -o ${executable}`, { timeout: 10000 });
+                } catch (e: any) {
+                    results.push({
+                        testCaseId: tc.id || `test_${i + 1}`,
+                        passed: false,
+                        expected: tc.expectedOutput,
+                        actual: "",
+                        error: e.stderr?.toString() || e.message || "Compilation Error",
+                        statusDescription: "Compile Error"
+                    });
+                    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+                    continue;
+                }
+            }
+            
             try {
-                fs.writeFileSync(tempFile, code);
-                const output = execSync(`node ${tempFile}`, { 
+                if (lang !== "cpp" && lang !== "c++") {
+                    fs.writeFileSync(tempFile, wrappedCode);
+                }
+                
+                const output = execSync(command, { 
                     input: tc.input, 
                     encoding: 'utf8',
                     timeout: 5000 
                 });
+                
+                const actualOutput = output.trim();
+                const expectedOutput = tc.expectedOutput.trim();
+                
                 results.push({
                     testCaseId: tc.id || `test_${i + 1}`,
-                    passed: output.trim() === tc.expectedOutput.trim(),
+                    passed: actualOutput === expectedOutput,
                     expected: tc.expectedOutput,
-                    actual: output,
+                    actual: actualOutput,
                     statusDescription: "Accepted"
                 });
             } catch (e: any) {
@@ -226,12 +320,17 @@ export class CodeExecutor {
                     testCaseId: tc.id || `test_${i + 1}`,
                     passed: false,
                     expected: tc.expectedOutput,
-                    actual: e.stdout || "",
-                    error: e.stderr || e.message,
-                    statusDescription: "Runtime Error"
+                    actual: e.stdout?.toString() || "",
+                    error: e.stderr?.toString() || e.message,
+                    statusDescription: e.message?.includes("ETIMEDOUT") ? "Time Limit Exceeded" : "Runtime Error"
                 });
             } finally {
-                if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+                if (fs.existsSync(tempFile)) {
+                    try { fs.unlinkSync(tempFile); } catch (err) {}
+                }
+                if ((lang === "cpp" || lang === "c++") && fs.existsSync(path.join(tempDir, `local_${id}.out`))) {
+                    try { fs.unlinkSync(path.join(tempDir, `local_${id}.out`)); } catch (err) {}
+                }
             }
         }
         return results;

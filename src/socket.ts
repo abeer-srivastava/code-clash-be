@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Server } from "http";
 import { RedisManager } from "./redis.js";
 import { CodeExecutor } from "./executor.js";
-import { PrismaClient } from "@prisma/client";
+import prisma from "./ds.js";
 import type {
     WebSocketMessage,
     ServerMessage,
@@ -55,9 +55,11 @@ export class SocketManager {
     private rooms: Map<string, Set<string>>; // roomId -> Set of userIds
     private battleRooms: Map<string, BattleRoom>; // roomId -> BattleRoom
     private executor: CodeExecutor;
-    private prisma: PrismaClient;
     private readonly BATTLE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
     private readonly BATTLE_CHECK_INTERVAL = 1000; // 1 second
+    private readonly MATCHMAKING_INTERVAL = 5000; // 5 seconds
+    private readonly BASE_ELO_RANGE = 100;
+    private readonly ELO_EXPANSION_PER_MINUTE = 50;
 
     private constructor(server: Server) {
         this.wss = new WebSocketServer({ server });
@@ -66,10 +68,10 @@ export class SocketManager {
         this.rooms = new Map();
         this.battleRooms = new Map();
         this.executor = CodeExecutor.getInstance();
-        this.prisma = new PrismaClient({
-            log: ['error'],
-        });
         this.init();
+        
+        // Start periodic matchmaking
+        setInterval(() => this.runMatchmaking(), this.MATCHMAKING_INTERVAL);
     }
 
     public static getInstance(server?: Server): SocketManager {
@@ -136,6 +138,10 @@ export class SocketManager {
                     await this.handleChat(ws, payload);
                     break;
 
+                case "CURSOR_MOVE":
+                    this.handleCursorMove(ws, payload);
+                    break;
+
                 default:
                     this.sendError(ws, "UNKNOWN_MESSAGE_TYPE", `Unknown message type: ${type}`);
             }
@@ -143,6 +149,18 @@ export class SocketManager {
             console.error(`Error handling message type ${type}:`, error);
             this.sendError(ws, "MESSAGE_HANDLER_ERROR", error.message);
         }
+    }
+
+    private handleCursorMove(ws: WebSocket, payload: any) {
+        const userId = (ws as any).userId;
+        const { roomId, line, ch } = payload;
+        if (!userId || !roomId) return;
+
+        // Broadcast to other users in the room
+        this.sendToRoom(roomId, {
+            type: "CURSOR_MOVE",
+            payload: { roomId, userId, line, ch }
+        } as any, userId);
     }
 
     private async handleAuth(ws: WebSocket, payload: any) {
@@ -181,15 +199,26 @@ export class SocketManager {
         const elo = payload.elo || 1200;
         const language = payload.language || "javascript";
 
-        const redis = RedisManager.getInstance();
-        await redis.addToQueue(userId, elo);
+        console.log(`[MATCHMAKING] User ${userId} joining queue with ELO ${elo} (${language})`);
 
-        // Find a match
-        const match = await redis.findMatch(userId, elo);
+        const redis = RedisManager.getInstance();
+        await redis.addToQueue(userId, elo, language);
+
+        // Try to find a match immediately for better UX
+        const match = await redis.findMatch(userId, elo, this.BASE_ELO_RANGE);
         if (match) {
+            console.log(`[MATCHMAKING] Immediate match found for ${userId}: ${match}`);
             await redis.removeFromQueue(userId);
             await redis.removeFromQueue(match);
             await this.createBattle(userId, match, language);
+        } else {
+            // Notify user they are in queue
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: "IN_QUEUE",
+                    payload: { elo, message: "Searching for opponents..." }
+                }));
+            }
         }
     }
 
@@ -319,7 +348,7 @@ export class SocketManager {
     private async createManualBattle(roomId: string, player1Id: string, player2Id: string, difficulty: "EASY" | "MEDIUM" | "HARD" = "EASY") {
         try {
             // Fetch random question of the chosen difficulty
-            const questions = await this.prisma.question.findMany({
+            const questions = await prisma.question.findMany({
                 where: { difficulty }
             });
 
@@ -438,6 +467,12 @@ export class SocketManager {
         }
 
         try {
+            // Broadcast that user is running tests
+            this.sendToRoom(roomId, {
+                type: "OPPONENT_PROGRESS",
+                payload: { userId, roomId, activity: "RUNNING" }
+            } as any, userId);
+
             // Priority 1: Use non-hidden testCases from the database
             // Priority 2: Fallback to examples if no testCases exist
             let testCasesToRun: any[] = [];
@@ -464,7 +499,7 @@ export class SocketManager {
                 return;
             }
 
-            const results = await this.executor.executeTestCases(code, language, testCasesToRun as any);
+            const results = await this.executor.executeTestCases(code, language, testCasesToRun as any, battleRoom.question);
             
             const testsPassed = results.filter(r => r.passed).length;
             const totalTests = results.length;
@@ -487,6 +522,19 @@ export class SocketManager {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify(runResult));
             }
+
+            // Broadcast results to opponent
+            this.sendToRoom(roomId, {
+                type: "OPPONENT_PROGRESS",
+                payload: { 
+                    userId, 
+                    roomId, 
+                    activity: "IDLE", 
+                    testsPassed, 
+                    totalTests,
+                    success: passedAllTests
+                }
+            } as any, userId);
         } catch (error: any) {
             this.sendError(ws, "EXECUTION_ERROR", error.message);
         }
@@ -530,15 +578,35 @@ export class SocketManager {
         // Execute code against all test cases
         const submissionTime = Date.now() - battleRoom.startTime;
         console.log(`[SOCKET] Starting final submission for ${userId}. Found ${battleRoom.question?.testCases?.length || 0} total test cases.`);
+        
+        // Broadcast starting submission
+        this.sendToRoom(roomId, {
+            type: "OPPONENT_PROGRESS",
+            payload: { userId, roomId, activity: "SUBMITTING" }
+        } as any, userId);
+
         try {
             // Final submission uses ALL test cases (including hidden ones)
             const testCases = battleRoom.question?.testCases || [];
-            const results = await this.executor.executeTestCases(code, language, testCases as any);
+            const results = await this.executor.executeTestCases(code, language, testCases as any, battleRoom.question);
             
             const testsPassed = results.filter(r => r.passed).length;
             const totalTests = results.length;
             const passedAllTests = testsPassed === totalTests && totalTests > 0;
             const totalExecutionTime = results.reduce((acc, r) => acc + (r.time || 0), 0);
+
+            // Broadcast results to opponent
+            this.sendToRoom(roomId, {
+                type: "OPPONENT_PROGRESS",
+                payload: { 
+                    userId, 
+                    roomId, 
+                    activity: "IDLE", 
+                    testsPassed, 
+                    totalTests,
+                    success: passedAllTests
+                }
+            } as any, userId);
 
             const submission = {
                 code: code as string,
@@ -601,7 +669,19 @@ export class SocketManager {
 
     private async createBattle(player1Id: string, player2Id: string, language: string) {
         try {
-            // Use mock user info (TODO: Fetch from database using Prisma)
+            // Fetch random EASY question by default for matchmaking
+            const difficulty = "EASY";
+            const questions = await prisma.question.findMany({
+                where: { difficulty }
+            });
+
+            if (questions.length === 0) {
+                console.error(`[BATTLE] No questions found for difficulty: ${difficulty}`);
+                return;
+            }
+
+            const selectedQuestion: any = questions[Math.floor(Math.random() * questions.length)];
+
             const player1Username = this.userInfo.get(player1Id)?.username || `User_${player1Id.substring(0, 6)}`;
             const player2Username = this.userInfo.get(player2Id)?.username || `User_${player2Id.substring(0, 6)}`;
             const player1Elo = this.userInfo.get(player1Id)?.elo || 1200;
@@ -630,30 +710,16 @@ export class SocketManager {
                     startTime,
                 },
                 startTime,
-                questionId: 1, // TODO: Select random question
-            };
-
-            // TODO: Fetch actual question from database
-            // For now, use a sample question
-            battleRoom.question = {
-                id: 1,
-                title: "Hello World",
-                prompt: 'Write a function that prints "Hello Code Clash!" to the console.',
-                difficulty: "EASY",
-                examples: [
-                    {
-                        input: "",
-                        output: "Hello Code Clash!",
-                        explanation: "Simply print the message",
-                    },
-                ],
-                testCases: [
-                    {
-                        id: "test_1",
-                        input: "",
-                        expectedOutput: "Hello Code Clash!",
-                    },
-                ],
+                questionId: selectedQuestion.id,
+                question: {
+                    id: selectedQuestion.id,
+                    title: selectedQuestion.title,
+                    prompt: selectedQuestion.prompt,
+                    difficulty: selectedQuestion.difficulty as any,
+                    examples: selectedQuestion.examples as any,
+                    testCases: selectedQuestion.testCases as any,
+                    starterCode: selectedQuestion.starterCode as any
+                }
             };
 
             this.battleRooms.set(roomId, battleRoom);
@@ -668,28 +734,32 @@ export class SocketManager {
                 payload: {
                     roomId,
                     opponentId: player2Id,
-                    questionId: battleRoom.questionId || 1,
-                    timeLimit: 15 * 60, // 15 minutes
+                    questionId: battleRoom.questionId as number,
+                    timeLimit: 15 * 60,
                 },
             };
 
-            player1Ws?.send(JSON.stringify(matchFoundMsg));
-            player2Ws?.send(
-                JSON.stringify({
-                    ...matchFoundMsg,
-                    payload: {
-                        ...matchFoundMsg.payload,
-                        opponentId: player1Id,
-                    },
-                })
-            );
+            if (player1Ws && player1Ws.readyState === WebSocket.OPEN) {
+                player1Ws.send(JSON.stringify(matchFoundMsg));
+            }
+            if (player2Ws && player2Ws.readyState === WebSocket.OPEN) {
+                player2Ws.send(
+                    JSON.stringify({
+                        ...matchFoundMsg,
+                        payload: {
+                            ...matchFoundMsg.payload,
+                            opponentId: player1Id,
+                        },
+                    })
+                );
+            }
 
             // Set battle timeout
             setTimeout(() => this.timeoutBattle(roomId), this.BATTLE_TIMEOUT);
 
-            console.log(`Battle created: ${roomId} (${player1Id} vs ${player2Id})`);
+            console.log(`[BATTLE] Battle created: ${roomId} (${player1Username} vs ${player2Username}) with question: ${selectedQuestion.title}`);
         } catch (error) {
-            console.error("Error creating battle:", error);
+            console.error("[BATTLE] Error creating battle:", error);
         }
     }
 
@@ -826,11 +896,12 @@ export class SocketManager {
         }
     }
 
-    private sendToRoom(roomId: string, message: ServerMessage) {
+    private sendToRoom(roomId: string, message: ServerMessage, excludeUserId?: string) {
         const roomUsers = this.rooms.get(roomId);
         if (roomUsers) {
             const data = JSON.stringify(message);
             roomUsers.forEach((userId) => {
+                if (userId === excludeUserId) return;
                 const ws = this.users.get(userId);
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(data);
@@ -852,6 +923,52 @@ export class SocketManager {
 
     public broadcastToRoom(roomId: string, message: any) {
         this.sendToRoom(roomId, message);
+    }
+
+    private async runMatchmaking() {
+        try {
+            const redis = RedisManager.getInstance();
+            const queue = await redis.getQueue();
+            
+            if (queue.length < 2) return;
+
+            console.log(`[MATCHMAKING] Checking queue of size ${queue.length}`);
+
+            const matchedUsers = new Set<string>();
+
+            for (const userId of queue) {
+                if (matchedUsers.has(userId)) continue;
+
+                const elo = await redis.getUserElo(userId);
+                const joinTime = await redis.getUserJoinTime(userId);
+                if (elo === null || joinTime === null) continue;
+
+                const waitTimeMinutes = (Date.now() - joinTime) / (60 * 1000);
+                const currentRange = this.BASE_ELO_RANGE + (waitTimeMinutes * this.ELO_EXPANSION_PER_MINUTE);
+
+                const matchId = await redis.findMatch(userId, elo, currentRange);
+                
+                if (matchId && !matchedUsers.has(matchId)) {
+                    console.log(`[MATCHMAKING] Found match: ${userId} vs ${matchId} (Range: ${currentRange})`);
+                    
+                    matchedUsers.add(userId);
+                    matchedUsers.add(matchId);
+
+                    const userLang = await redis.getUserLanguage(userId);
+                    const matchLang = await redis.getUserLanguage(matchId);
+                    
+                    // Prefer user's language, fallback to match's, then javascript
+                    const finalLang = userLang || matchLang || "javascript";
+
+                    await redis.removeFromQueue(userId);
+                    await redis.removeFromQueue(matchId);
+
+                    await this.createBattle(userId, matchId, finalLang);
+                }
+            }
+        } catch (error) {
+            console.error("[MATCHMAKING] Error in periodic matcher:", error);
+        }
     }
 }
 

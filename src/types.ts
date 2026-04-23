@@ -167,6 +167,28 @@ export interface QuestionData {
     memoryLimit?: number; // MB
 }
 
+export interface CursorMoveMessage {
+    type: "CURSOR_MOVE";
+    payload: {
+        roomId: string;
+        userId: string;
+        line: number;
+        ch: number;
+    };
+}
+
+export interface OpponentProgressMessage {
+    type: "OPPONENT_PROGRESS";
+    payload: {
+        userId: string;
+        roomId: string;
+        activity: "RUNNING" | "SUBMITTING" | "IDLE";
+        testsPassed?: number;
+        totalTests?: number;
+        success?: boolean;
+    };
+}
+
 // ============ CHAT ============
 export interface ChatMessage {
     type: "CHAT";
@@ -246,6 +268,8 @@ export type WebSocketMessage =
     | ChatMessage
     | BattleEndMessage
     | DisconnectMessage
+    | CursorMoveMessage
+    | OpponentProgressMessage
     | ErrorMessage;
 
 export type ServerMessage =
@@ -256,6 +280,8 @@ export type ServerMessage =
     | SubmissionResultMessage
     | ChatMessageReceived
     | BattleEndMessage
+    | CursorMoveMessage
+    | OpponentProgressMessage
     | ErrorMessage;
 
 // ============ DATABASE MODELS ============

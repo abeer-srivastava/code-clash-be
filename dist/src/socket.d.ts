@@ -7,13 +7,16 @@ export declare class SocketManager {
     private rooms;
     private battleRooms;
     private executor;
-    private prisma;
     private readonly BATTLE_TIMEOUT;
     private readonly BATTLE_CHECK_INTERVAL;
+    private readonly MATCHMAKING_INTERVAL;
+    private readonly BASE_ELO_RANGE;
+    private readonly ELO_EXPANSION_PER_MINUTE;
     private constructor();
     static getInstance(server?: Server): SocketManager;
     private init;
     private handleMessage;
+    private handleCursorMove;
     private handleAuth;
     private handleJoinMatchmaking;
     private handleJoinRoom;
@@ -31,5 +34,6 @@ export declare class SocketManager {
     private sendToRoom;
     private sendError;
     broadcastToRoom(roomId: string, message: any): void;
+    private runMatchmaking;
 }
 //# sourceMappingURL=socket.d.ts.map
